@@ -13,8 +13,12 @@ export type Stats = {
 // the running turn: tokens spent so far (subagents included), main-loop requests, the 5h limit at submit
 export type Live = { tokens: number; steps: number; startLimit: number | null }
 
+// the last finished main turn: its first request's input (context + prompt), all tokens spent (subagents included),
+// requests, measured 5h-limit rise
+export type Last = { input: number; tokens: number; steps: number; measured: number | null }
+
 declare module 'claude-code' {
   interface PluginState {
-    'usage-prediction': { draft: number; stats: Stats | null; effort: string | null; live: Live | null }
+    'usage-prediction': { draft: number; stats: Stats | null; effort: string | null; live: Live | null; last: Last | null }
   }
 }

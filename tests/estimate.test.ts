@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { estimate, limitShare, pickLang, predict, prettyModel, quantile } from '../hooks/register'
+import { estimate, lastShare, limitShare, MESSAGES, pickLang, predict, prettyModel, quantile } from '../hooks/register'
 
 const STATS = { model: 'm', turns: 3, ratio: 2, output: 1000, limitPct: 0, limitTokens: 0, mults: [] as number[] }
 
@@ -46,4 +46,13 @@ test('pickLang: setting wins, auto follows the locale', async () => {
   expect(pickLang('auto', undefined)).toBe('en')
   expect(pickLang('en', 'ko_KR.UTF-8')).toBe('en')
   expect(pickLang('ko', 'en_US')).toBe('ko')
+})
+
+test('lastShare prefers the measured rise, then the estimate, then <0.1%', async () => {
+  const t = MESSAGES.ko
+  const s = { ...STATS, limitPct: 2, limitTokens: 400000 }
+  expect(lastShare({ tokens: 100000, measured: 1.2 }, s, t)).toBe(' · 5h 한도의 1.2% 소모 (실측)')
+  expect(lastShare({ tokens: 100000, measured: 0 }, s, t)).toBe(' · 5h 한도의 0.5% 소모 (추정)')
+  expect(lastShare({ tokens: 100000, measured: 0 }, null, t)).toBe(' · 5h 한도의 <0.1% 소모')
+  expect(lastShare({ tokens: 100000, measured: null }, null, t)).toBe('')
 })

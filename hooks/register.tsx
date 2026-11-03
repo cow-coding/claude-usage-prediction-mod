@@ -7,6 +7,7 @@ const draft = atom({ plugin: 'usage-prediction', key: 'draft' } as const, 0)
 const stats = atom({ plugin: 'usage-prediction', key: 'stats' } as const, null)
 const effort = atom({ plugin: 'usage-prediction', key: 'effort' } as const, null)
 const live = atom({ plugin: 'usage-prediction', key: 'live' } as const, null)
+const last = atom({ plugin: 'usage-prediction', key: 'last' } as const, null)
 
 // ponytail: heuristic tokenizer (ASCII ~4 chars/token, other scripts ~1 char/token); swap for a count-tokens call if precision matters
 export const estimate = (text: string) => {
@@ -70,6 +71,7 @@ export const MESSAGES = {
     submit: '▶ 이 입력을 제출하면 ',
     tokens: '토큰',
     ofLimit: (x: string) => `5h 한도의 ${x}`,
+    willUse: '를 소모하게 됩니다',
     ofLeft: (left: string, x: string) => ` (남은 한도 ${left} 중 ${x})`,
     big: (t: string, x?: string) => ` · 큰 작업이면 ~${t}${x ? ` (${x})` : ''}`,
     learning: (t: string) => ` (한도 % 학습 중: ${t} 토큰 집계, 사용률 0.1% 변화 대기)`,
@@ -80,12 +82,16 @@ export const MESSAGES = {
     spent: (t: string) => `${t} 토큰`,
     measured: (x: string) => ` · 실측 +${x}`,
     vsTypical: (k: string) => ` (보통 턴의 ${k}배)`,
-    predicted: (typ: string, big?: string) => `예측 보통 ~${typ}${big ? ` · 큰 작업 ~${big}` : ''}`,
+    last: (i: string, w: string, total: string) => `↺ 이전 작업: 입력 ${i} + 작업 중 ${w} = 총 ${total} 토큰`,
+    lastUsed: (x: string) => ` · 5h 한도의 ${x} 소모`,
+    measuredTag: ' (실측)',
+    estimatedTag: ' (추정)',
   },
   en: {
     submit: '▶ Submitting this will use ',
     tokens: 'tokens',
     ofLimit: (x: string) => `${x} of the 5h limit`,
+    willUse: '',
     ofLeft: (left: string, x: string) => ` (${x} of the ${left} left)`,
     big: (t: string, x?: string) => ` · heavy task ~${t}${x ? ` (${x})` : ''}`,
     learning: (t: string) => ` (learning the limit %: ${t} tokens seen, waiting for a 0.1% move)`,
@@ -96,13 +102,28 @@ export const MESSAGES = {
     spent: (t: string) => `${t} tokens`,
     measured: (x: string) => ` · measured +${x}`,
     vsTypical: (k: string) => ` (${k}× a typical turn)`,
-    predicted: (typ: string, big?: string) => `predicted typical ~${typ}${big ? ` · heavy ~${big}` : ''}`,
+    last: (i: string, w: string, total: string) => `↺ Last turn: input ${i} + while working ${w} = ${total} tokens`,
+    lastUsed: (x: string) => ` · used ${x} of the 5h limit`,
+    measuredTag: ' (measured)',
+    estimatedTag: ' (estimated)',
   },
 }
 type Lang = keyof typeof MESSAGES
 
 export const pickLang = (setting: unknown, locale: string | undefined): Lang =>
   setting === 'en' || setting === 'ko' ? setting : locale?.toLowerCase().startsWith('ko') ? 'ko' : 'en'
+
+// the measured rise when the limit moved, else the learned rate's estimate, else under the 0.1% the limit reports
+export const lastShare = (
+  prev: { tokens: number; measured: number | null },
+  s: Stats | null,
+  t: { lastUsed: (x: string) => string; measuredTag: string; estimatedTag: string },
+) => {
+  if (prev.measured !== null && prev.measured > 0) return t.lastUsed(`${prev.measured.toFixed(1)}%`) + t.measuredTag
+  const est = limitShare(prev.tokens, s)
+  if (est !== undefined) return t.lastUsed(`${est.toFixed(1)}%`) + t.estimatedTag
+  return prev.measured === 0 ? t.lastUsed('<0.1%') : ''
+}
 
 export const register: Register = (on, options) => {
   let base = 0 // context + prompt tokens at submit, i.e. one request's input
@@ -179,7 +200,17 @@ export const register: Register = (on, options) => {
       })
       await $.store.set('stats', await read($, stats))
     }
-    if (!e.agentId) await update($, live, () => null)
+    if (!e.agentId) {
+      const running = await read($, live)
+      if (running && base > 0) {
+        const now = fiveHour((await $.session.usage()).rateLimits)
+        const measured = now !== undefined && running.startLimit !== null && now >= running.startLimit ? now - running.startLimit : null
+        // the turn's own usage when no step was counted (a reload mid-turn)
+        const tokens = running.tokens || (u ? u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens : 0)
+        if (tokens > 0) await update($, last, () => ({ input: Math.min(base, tokens), tokens, steps: running.steps, measured }))
+      }
+      await update($, live, () => null)
+    }
     return next(e)
   })
 
@@ -191,6 +222,7 @@ export const register: Register = (on, options) => {
     const prompt = await read($, draft)
     const s = await read($, stats)
     const running = await read($, live)
+    const prev = await read($, last)
     const model = prettyModel(await $.session.model())
     const level = await read($, effort)
     const p = predict(prompt, context, s)
@@ -198,33 +230,28 @@ export const register: Register = (on, options) => {
 
     const meta = `${model}${level ? ` · effort ${level}` : ''} │ `
 
+    // the running turn's figures, drawn as a third row so the prediction stays in view
+    let progress = null
     if (e.props.isWorking && running) {
-      const share = limitShare(running.tokens, s)
+      const spentShare = limitShare(running.tokens, s)
       const measured = used !== undefined && running.startLimit !== null ? used - running.startLimit : undefined
       const typical = s?.mults?.length ? base * quantile(s.mults, 0.5) : undefined
-      const heavy = (s?.mults?.length ?? 0) >= RANGE_MIN_TURNS ? base * quantile(s!.mults, 0.9) : undefined
-      return (
-        <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
-          <Text>
-            <Text color="claude" weight="bold">{t.working}</Text>
-            <Text color="inactive">{t.steps(running.steps)}</Text>
-            <Text weight="bold">{t.spent(fmt(running.tokens))}</Text>
-            {share !== undefined && (
-              <Text>
-                <Text> ≈ </Text>
-                <Text color="claude" weight="bold">{t.ofLimit(`${share.toFixed(1)}%`)}</Text>
-              </Text>
-            )}
-            {measured !== undefined && measured > 0 && <Text color="inactive">{t.measured(`${measured.toFixed(1)}%`)}</Text>}
-            {typical !== undefined && typical > 0 && running.tokens > typical * 1.5 && (
-              <Text color="warning">{t.vsTypical((running.tokens / typical).toFixed(1))}</Text>
-            )}
-          </Text>
-          <Text color="inactive">
-            {meta}
-            {typical ? t.predicted(fmt(typical), heavy === undefined ? undefined : fmt(heavy)) : ''}
-          </Text>
-        </Box>
+      progress = (
+        <Text>
+          <Text color="claude" weight="bold">{t.working}</Text>
+          <Text color="inactive">{t.steps(running.steps)}</Text>
+          <Text weight="bold">{t.spent(fmt(running.tokens))}</Text>
+          {spentShare !== undefined && (
+            <Text>
+              <Text> ≈ </Text>
+              <Text color="claude" weight="bold">{t.ofLimit(`${spentShare.toFixed(1)}%`)}</Text>
+            </Text>
+          )}
+          {measured !== undefined && measured > 0 && <Text color="inactive">{t.measured(`${measured.toFixed(1)}%`)}</Text>}
+          {typical !== undefined && typical > 0 && running.tokens > typical * 1.5 && (
+            <Text color="warning">{t.vsTypical((running.tokens / typical).toFixed(1))}</Text>
+          )}
+        </Text>
       )
     }
 
@@ -241,6 +268,7 @@ export const register: Register = (on, options) => {
             <Text>
               <Text> = </Text>
               <Text color="claude" weight="bold">{t.ofLimit(`${share.toFixed(1)}%`)}</Text>
+              {t.willUse && <Text>{t.willUse}</Text>}
               {left !== undefined && left > 0 && <Text color="inactive">{t.ofLeft(pct(left), pct((share / left) * 100))}</Text>}
             </Text>
           )}
@@ -249,10 +277,18 @@ export const register: Register = (on, options) => {
           )}
           {share === undefined && used !== undefined && <Text color="inactive">{t.learning(fmt(s?.limitTokens ?? 0))}</Text>}
         </Text>
+        {prev && (
+          <Text color="inactive">
+            {t.last(fmt(prev.input), fmt(prev.tokens - prev.input), fmt(prev.tokens))}
+            {prev.steps > 0 ? ` · ${t.steps(prev.steps).replace(/ · $/, '')}` : ''}
+            {lastShare(prev, s, t)}
+          </Text>
+        )}
         <Text color="inactive">
           {meta}
           {s ? t.detail(fmt(p.input), fmt(p.output), s.ratio.toFixed(1), fmt(prompt)) : t.firstTurn(fmt(prompt))}
         </Text>
+        {progress}
       </Box>
     )
   })
