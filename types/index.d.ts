@@ -10,8 +10,9 @@ export type Stats = {
   mults: number[]
 }
 
-// the running turn: tokens spent so far (subagents included), main-loop requests, the 5h limit at submit
-export type Live = { tokens: number; steps: number; startLimit: number | null }
+// the running turn: tokens spent so far (subagents included), main-loop requests, the 5h limit at submit,
+// one request's input at submit (kept here, not in a module variable, so a reload mid-turn keeps it)
+export type Live = { tokens: number; steps: number; startLimit: number | null; base: number }
 
 // the last finished main turn: its first request's input (context + prompt), all tokens spent (subagents included),
 // requests, measured 5h-limit rise

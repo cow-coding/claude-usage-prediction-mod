@@ -126,8 +126,6 @@ export const lastShare = (
 }
 
 export const register: Register = (on, options) => {
-  let base = 0 // context + prompt tokens at submit, i.e. one request's input
-  let limitAtSubmit: number | undefined
   let lang: Lang = 'en'
 
   on('session.start', async ($, e, next) => {
@@ -152,9 +150,8 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     const { context, rateLimits } = await $.session.usage()
-    base = (context.tokens ?? 0) + (await read($, draft))
-    limitAtSubmit = fiveHour(rateLimits)
-    await update($, live, () => ({ tokens: 0, steps: 0, startLimit: limitAtSubmit ?? null }))
+    const base = (context.tokens ?? 0) + (await read($, draft))
+    await update($, live, () => ({ tokens: 0, steps: 0, startLimit: fiveHour(rateLimits) ?? null, base }))
     return next(e)
   })
 
@@ -174,6 +171,9 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const u = e.usage
+    const running = e.agentId ? null : await read($, live)
+    const base = running?.base ?? 0
+    const limitAtSubmit = running?.startLimit ?? undefined
     if (!e.agentId && u && base > 0 && !e.isAborted) {
       const input = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
       const ratio = input / base
@@ -201,7 +201,6 @@ export const register: Register = (on, options) => {
       await $.store.set('stats', await read($, stats))
     }
     if (!e.agentId) {
-      const running = await read($, live)
       if (running && base > 0) {
         const now = fiveHour((await $.session.usage()).rateLimits)
         const measured = now !== undefined && running.startLimit !== null && now >= running.startLimit ? now - running.startLimit : null
@@ -235,7 +234,7 @@ export const register: Register = (on, options) => {
     if (e.props.isWorking && running) {
       const spentShare = limitShare(running.tokens, s)
       const measured = used !== undefined && running.startLimit !== null ? used - running.startLimit : undefined
-      const typical = s?.mults?.length ? base * quantile(s.mults, 0.5) : undefined
+      const typical = s?.mults?.length ? running.base * quantile(s.mults, 0.5) : undefined
       progress = (
         <Text>
           <Text color="claude" weight="bold">{t.working}</Text>
