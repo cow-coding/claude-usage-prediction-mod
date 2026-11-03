@@ -1,5 +1,13 @@
 {
   "name": "claude-usage-prediction-mod",
-  "owner": { "name": "cow-coding" },
-  "plugins": [{ "name": "usage-prediction", "source": "./" }]
+  "description": "Claude Code mod that predicts the token use and 5h-limit share of your next prompt",
+  "owner": {
+    "name": "cow-coding"
+  },
+  "plugins": [
+    {
+      "name": "usage-prediction",
+      "source": "./"
+    }
+  ]
 }

@@ -6,6 +6,7 @@ import type { Stats } from '../types'
 const draft = atom({ plugin: 'usage-prediction', key: 'draft' } as const, 0)
 const stats = atom({ plugin: 'usage-prediction', key: 'stats' } as const, null)
 const effort = atom({ plugin: 'usage-prediction', key: 'effort' } as const, null)
+const live = atom({ plugin: 'usage-prediction', key: 'live' } as const, null)
 
 // ponytail: heuristic tokenizer (ASCII ~4 chars/token, other scripts ~1 char/token); swap for a count-tokens call if precision matters
 export const estimate = (text: string) => {
@@ -27,14 +28,27 @@ export const prettyModel = (id: string) => {
   return `${family[0]!.toUpperCase()}${family.slice(1).toLowerCase()} ${major}${minor ? `.${minor}` : ''}`
 }
 
+// nearest-rank quantile; q in [0, 1]
+export const quantile = (xs: number[], q: number) => {
+  const sorted = [...xs].sort((a, b) => a - b)
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1))] ?? 0
+}
+
+const MULTS_KEPT = 30
+const RANGE_MIN_TURNS = 5
+
 export const predict = (prompt: number, context: { tokens?: number; window: number }, s: Stats | null) => {
   const oneCall = (context.tokens ?? 0) + prompt
   const input = oneCall * Math.max(1, s?.ratio ?? 1)
   const output = s?.output ?? 0
+  const mults = s?.mults ?? []
   return {
     input,
     output,
-    total: input + output,
+    // median turn when there is history, the mean otherwise
+    total: mults.length >= 3 ? oneCall * quantile(mults, 0.5) : input + output,
+    // a heavy turn: the 90th percentile, once enough turns are seen
+    big: mults.length >= RANGE_MIN_TURNS ? oneCall * quantile(mults, 0.9) : undefined,
   }
 }
 
@@ -48,12 +62,56 @@ const fiveHour = (limits: { kind: string; percentUsed: number }[]) =>
 export const limitShare = (total: number, s: Stats | null) =>
   s && s.limitPct > 0 && s.limitTokens > 0 ? total * (s.limitPct / s.limitTokens) : undefined
 
-export const register: Register = on => {
+const usageTokens = (u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }) =>
+  u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+
+export const MESSAGES = {
+  ko: {
+    submit: '▶ 이 입력을 제출하면 ',
+    tokens: '토큰',
+    ofLimit: (x: string) => `5h 한도의 ${x}`,
+    ofLeft: (left: string, x: string) => ` (남은 한도 ${left} 중 ${x})`,
+    big: (t: string, x?: string) => ` · 큰 작업이면 ~${t}${x ? ` (${x})` : ''}`,
+    learning: (t: string) => ` (한도 % 학습 중: ${t} 토큰 집계, 사용률 0.1% 변화 대기)`,
+    detail: (i: string, o: string, r: string, p: string) => `입력 ${i} · 출력 ${o} · 요청 ×${r} · 프롬프트 ${p}`,
+    firstTurn: (p: string) => `입력만 (첫 턴 후 출력 예측) · 프롬프트 ${p}`,
+    working: '⏳ 작업 중 ',
+    steps: (n: number) => `요청 ${n}회 · `,
+    spent: (t: string) => `${t} 토큰`,
+    measured: (x: string) => ` · 실측 +${x}`,
+    vsTypical: (k: string) => ` (보통 턴의 ${k}배)`,
+    predicted: (typ: string, big?: string) => `예측 보통 ~${typ}${big ? ` · 큰 작업 ~${big}` : ''}`,
+  },
+  en: {
+    submit: '▶ Submitting this will use ',
+    tokens: 'tokens',
+    ofLimit: (x: string) => `${x} of the 5h limit`,
+    ofLeft: (left: string, x: string) => ` (${x} of the ${left} left)`,
+    big: (t: string, x?: string) => ` · heavy task ~${t}${x ? ` (${x})` : ''}`,
+    learning: (t: string) => ` (learning the limit %: ${t} tokens seen, waiting for a 0.1% move)`,
+    detail: (i: string, o: string, r: string, p: string) => `in ${i} · out ${o} · requests ×${r} · prompt ${p}`,
+    firstTurn: (p: string) => `input only (output predicted after the first turn) · prompt ${p}`,
+    working: '⏳ Working ',
+    steps: (n: number) => `${n} requests · `,
+    spent: (t: string) => `${t} tokens`,
+    measured: (x: string) => ` · measured +${x}`,
+    vsTypical: (k: string) => ` (${k}× a typical turn)`,
+    predicted: (typ: string, big?: string) => `predicted typical ~${typ}${big ? ` · heavy ~${big}` : ''}`,
+  },
+}
+type Lang = keyof typeof MESSAGES
+
+export const pickLang = (setting: unknown, locale: string | undefined): Lang =>
+  setting === 'en' || setting === 'ko' ? setting : locale?.toLowerCase().startsWith('ko') ? 'ko' : 'en'
+
+export const register: Register = (on, options) => {
   let base = 0 // context + prompt tokens at submit, i.e. one request's input
   let limitAtSubmit: number | undefined
+  let lang: Lang = 'en'
 
   on('session.start', async ($, e, next) => {
     $.ui.status(undefined) // drop the status line an earlier version pinned
+    lang = pickLang(options.language, (await $.env.get('LC_ALL')) || (await $.env.get('LANG')))
     // a new session starts from what earlier sessions learned
     const saved = await $.store.get('stats')
     if ((await read($, stats)) === null && isStats(saved)) await update($, stats, () => saved)
@@ -75,16 +133,22 @@ export const register: Register = on => {
     const { context, rateLimits } = await $.session.usage()
     base = (context.tokens ?? 0) + (await read($, draft))
     limitAtSubmit = fiveHour(rateLimits)
+    await update($, live, () => ({ tokens: 0, steps: 0, startLimit: limitAtSubmit ?? null }))
     return next(e)
   })
 
-  // effort has no getter: take it from the main loop's last request
+  // counts every request of the running turn, subagents' included; effort has no getter, so it is taken here too
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId && e.effort !== undefined) {
       const level = String(e.effort)
       if ((await read($, effort)) !== level) await update($, effort, () => level)
     }
-    return yield* next(e)
+    const result = yield* next(e)
+    const u = result.usage
+    if (u) {
+      await update($, live, l => l && { ...l, tokens: l.tokens + usageTokens(u), steps: l.steps + (e.agentId ? 0 : 1) })
+    }
+    return result
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -92,6 +156,7 @@ export const register: Register = on => {
     if (!e.agentId && u && base > 0 && !e.isAborted) {
       const input = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
       const ratio = input / base
+      const mult = (input + u.output_tokens) / base
       const now = fiveHour((await $.session.usage()).rateLimits)
       // a negative delta means the window reset mid-turn: learn nothing from it
       const delta = now !== undefined && limitAtSubmit !== undefined && now >= limitAtSubmit ? now - limitAtSubmit : undefined
@@ -99,7 +164,7 @@ export const register: Register = on => {
       // a different model has its own tokenizer, verbosity and limit weight: start its averages over
       await update($, stats, (s): Stats => {
         if (!s || s.model !== u.model) {
-          return { model: u.model, turns: 1, ratio, output: u.output_tokens, limitPct: delta ?? 0, limitTokens: spent }
+          return { model: u.model, turns: 1, ratio, output: u.output_tokens, limitPct: delta ?? 0, limitTokens: spent, mults: [mult] }
         }
         const turns = s.turns + 1
         return {
@@ -109,50 +174,84 @@ export const register: Register = on => {
           output: blend(s.output, u.output_tokens, turns),
           limitPct: (s.limitPct ?? 0) + (delta ?? 0),
           limitTokens: (s.limitTokens ?? 0) + spent,
+          mults: [...(s.mults ?? []), mult].slice(-MULTS_KEPT),
         }
       })
       await $.store.set('stats', await read($, stats))
     }
+    if (!e.agentId) await update($, live, () => null)
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
+    const t = MESSAGES[lang]
     const { context, rateLimits } = await $.session.usage()
     const used = fiveHour(rateLimits)
     const prompt = await read($, draft)
     const s = await read($, stats)
+    const running = await read($, live)
     const model = prettyModel(await $.session.model())
     const level = await read($, effort)
     const p = predict(prompt, context, s)
-    const share = limitShare(p.total, s)
-    const left = used === undefined ? undefined : 100 - used
     const { Box, Text } = $.ui.resolve(e)
+
+    const meta = `${model}${level ? ` · effort ${level}` : ''} │ `
+
+    if (e.props.isWorking && running) {
+      const share = limitShare(running.tokens, s)
+      const measured = used !== undefined && running.startLimit !== null ? used - running.startLimit : undefined
+      const typical = s?.mults?.length ? base * quantile(s.mults, 0.5) : undefined
+      const heavy = (s?.mults?.length ?? 0) >= RANGE_MIN_TURNS ? base * quantile(s!.mults, 0.9) : undefined
+      return (
+        <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+          <Text>
+            <Text color="claude" weight="bold">{t.working}</Text>
+            <Text color="inactive">{t.steps(running.steps)}</Text>
+            <Text weight="bold">{t.spent(fmt(running.tokens))}</Text>
+            {share !== undefined && (
+              <Text>
+                <Text> ≈ </Text>
+                <Text color="claude" weight="bold">{t.ofLimit(`${share.toFixed(1)}%`)}</Text>
+              </Text>
+            )}
+            {measured !== undefined && measured > 0 && <Text color="inactive">{t.measured(`${measured.toFixed(1)}%`)}</Text>}
+            {typical !== undefined && typical > 0 && running.tokens > typical * 1.5 && (
+              <Text color="warning">{t.vsTypical((running.tokens / typical).toFixed(1))}</Text>
+            )}
+          </Text>
+          <Text color="inactive">
+            {meta}
+            {typical ? t.predicted(fmt(typical), heavy === undefined ? undefined : fmt(heavy)) : ''}
+          </Text>
+        </Box>
+      )
+    }
+
+    const share = limitShare(p.total, s)
+    const bigShare = p.big === undefined ? undefined : limitShare(p.big, s)
+    const left = used === undefined ? undefined : 100 - used
 
     return (
       <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
         <Text>
-          <Text color="claude" weight="bold">▶ 이 입력을 제출하면 </Text>
-          <Text weight="bold">{s ? `~${fmt(p.total)}` : `≥${fmt(p.input)}`} 토큰</Text>
+          <Text color="claude" weight="bold">{t.submit}</Text>
+          <Text weight="bold">{s ? `~${fmt(p.total)}` : `≥${fmt(p.input)}`} {t.tokens}</Text>
           {share !== undefined && (
             <Text>
               <Text> = </Text>
-              <Text color="claude" weight="bold">5h 한도의 {share.toFixed(1)}%</Text>
-              {left !== undefined && left > 0 && (
-                <Text color="inactive"> (남은 한도 {pct(left)} 중 {pct((share / left) * 100)})</Text>
-              )}
+              <Text color="claude" weight="bold">{t.ofLimit(`${share.toFixed(1)}%`)}</Text>
+              {left !== undefined && left > 0 && <Text color="inactive">{t.ofLeft(pct(left), pct((share / left) * 100))}</Text>}
             </Text>
           )}
-          {share === undefined && used !== undefined && (
-            <Text color="inactive">
-              {' '}(한도 % 학습 중: {fmt(s?.limitTokens ?? 0)} 토큰 집계, 사용률 0.1% 변화 대기)
-            </Text>
+          {p.big !== undefined && p.big > p.total * 1.3 && (
+            <Text color="inactive">{t.big(fmt(p.big), bigShare === undefined ? undefined : `${bigShare.toFixed(1)}%`)}</Text>
           )}
+          {share === undefined && used !== undefined && <Text color="inactive">{t.learning(fmt(s?.limitTokens ?? 0))}</Text>}
         </Text>
         <Text color="inactive">
-          {`${model}${level ? ` · effort ${level}` : ''} │ `}
-          {s ? `입력 ${fmt(p.input)} · 출력 ${fmt(p.output)} · 요청 ×${s.ratio.toFixed(1)}` : '입력만 (첫 턴 후 출력 예측)'}
-          {` · 프롬프트 ${fmt(prompt)}`}
+          {meta}
+          {s ? t.detail(fmt(p.input), fmt(p.output), s.ratio.toFixed(1), fmt(prompt)) : t.firstTurn(fmt(prompt))}
         </Text>
       </Box>
     )

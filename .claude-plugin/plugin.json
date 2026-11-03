@@ -1,1 +1,23 @@
-{ "name": "usage-prediction", "version": "0.1.0", "description": "Predicts how many tokens the next prompt will use, shown above the prompt box", "types": "./types/index.d.ts" }
+{
+  "name": "usage-prediction",
+  "version": "0.2.0",
+  "description": "Predicts how many tokens the next prompt will use, shown above the prompt box",
+  "author": {
+    "name": "cow-coding"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Display language. auto follows LANG / LC_ALL (ko_* shows Korean, anything else English).",
+      "default": "auto",
+      "options": [
+        "auto",
+        "en",
+        "ko"
+      ]
+    }
+  }
+}
