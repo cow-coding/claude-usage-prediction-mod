@@ -1,0 +1,1 @@
+{ "name": "usage-prediction", "version": "0.1.0", "description": "Predicts how many tokens the next prompt will use, shown above the prompt box", "types": "./types/index.d.ts" }
