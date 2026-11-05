@@ -1,0 +1,14 @@
+{
+  "name": "usage-prediction",
+  "version": "0.3.0",
+  "description": "Predict token consumption at submission and report completed Codex turns.",
+  "author": { "name": "cow-coding" },
+  "license": "MIT",
+  "hooks": "./codex/hooks.json",
+  "interface": {
+    "displayName": "Usage prediction",
+    "shortDescription": "Predict and track token usage",
+    "developerName": "cow-coding",
+    "category": "Developer Tools"
+  }
+}

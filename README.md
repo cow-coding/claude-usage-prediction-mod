@@ -1,6 +1,6 @@
 # usage-prediction
 
-A Claude Code mod that shows, in a box above the prompt, how many tokens the prompt you are typing will likely use once submitted, and what share of your 5-hour limit that is. While Claude works, the same box adds a row tracking what the running turn has actually spent.
+A Claude Code mod that shows, in a box above the prompt, how many tokens the prompt you are typing will likely use once submitted, and what share of your 5-hour limit that is. While Claude works, the same box adds a row tracking what the running turn has actually spent. This repository also includes a separate Codex CLI implementation; see [Codex CLI](#codex-cli) below.
 
 Before you submit:
 
@@ -64,6 +64,44 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 ## Developing
 
 Run it from a clone with `claude --plugin-dir <clone>`, or load it in every session by naming the folder in `~/.claude/settings.json`: `"env": { "CLAUDE_CODE_PLUGIN_DIRS": "<clone>" }`. Edits reload while a session runs. `claude plugin test <clone>` runs the tests.
+
+## Codex CLI
+
+Requires Node.js 18+ and a Codex CLI version that supports plugin lifecycle hooks. The implementation targets CLI 0.166.0; automated hook tests pass, but the actual Codex UI has not yet been verified. Claude Code continues to use `hooks/hooks.json`; Codex selects `.codex-plugin/plugin.json`, which explicitly loads `codex/hooks.json`.
+
+Install from a local checkout containing the Codex implementation:
+
+```sh
+codex plugin marketplace add /absolute/path/to/claude-usage-prediction-mod
+codex plugin add usage-prediction@claude-usage-prediction-mod
+```
+
+Alternatively, install from GitHub:
+
+```sh
+codex plugin marketplace add cow-coding/claude-usage-prediction-mod
+codex plugin add usage-prediction@claude-usage-prediction-mod
+```
+
+Start a new Codex CLI session and review/trust the plugin's hook definitions in `/hooks`. Codex skips untrusted hooks. See the official [plugin packaging guide](https://developers.openai.com/plugins/build/plugins).
+
+Codex behavior differs from the Claude Code box:
+
+- **On submit:** shows an approximate prompt-token count and, once completed turns have been collected, a typical full-turn estimate. After five samples it also shows a heavy-task estimate. Samples are grouped by model within the session and survive restarts.
+- **On completion:** shows the change in cumulative input/output/total tokens. Input already includes cached tokens; output already includes reasoning tokens. Missing categories are omitted rather than reported as zero. A repeated Stop hook replaces the sample for the current submission instead of counting it twice.
+- **5h share:** available only when the transcript supplies a 300-minute rate-limit window with a reset timestamp. It is learned from observed increases within the same window. A reset or missing data is not treated as zero consumption.
+- **Language:** follows `LC_ALL`/`LANG`. Set `USAGE_PREDICTION_LANGUAGE=en` or `ko` in the environment used to launch Codex to override it.
+- **Display:** hook messages are rendered by Codex as notices/warnings, so their color is controlled by Codex. There is no typing-time box or continuously updating progress row in this implementation.
+
+The reader uses the `event_msg/token_count` records in the `.jsonl` transcript path supplied to each hook. That transcript format is not a stable API. Compressed, paginated, missing or changed transcripts may not expose usage; the mod then says usage is unavailable. The first observed turn also needs an existing cumulative baseline for an accurate completion delta. Subagent usage is included only if Codex includes it in the parent transcript totals; separate subagent files are not scanned.
+
+Only numeric summaries, model IDs and turn IDs are stored locally in `PLUGIN_DATA` (fallback: `~/.codex/usage-prediction`); prompt text and conversation contents are not saved by this plugin or sent over the network. Codex and Claude learning data are independent.
+
+Run the Codex tests with:
+
+```sh
+node --test codex/usage.test.mjs
+```
 
 ## License
 
